@@ -3,6 +3,7 @@ import { ZkTelegramBotAppType, getSpaces } from "@/src/libs/spaces";
 import { getUserStore } from "@/src/libs/user-store";
 import env from "@/src/environments";
 import axios from "axios";
+import ServiceFactory from "@/src/libs/service-factory/service-factory";
 
 type JoinRequest = {
   groupId: string;
@@ -20,62 +21,46 @@ type Message = {
 const groupIdCommand = "/groupid";
 
 export async function POST(request: Request) {
+  const logger = ServiceFactory.getLoggerService();
   const update = await request.json();
-  if (env.isDev) { console.log(`Got update: ${JSON.stringify(update)}`); }
-  return await dispatchUpdate(update);
-}
+  logger.debug(`Got update: ${JSON.stringify(update)}`);
 
-const dispatchUpdate = async (update: any): Promise<Response> => {
   if (update["message"]) {
-    return handleMessageUpdate(await parseMessage(update));
+    const message = await parseMessage(update);
+    if (message.text.startsWith(groupIdCommand)) {
+      const messageReply = {
+        messageId: message.messageId,
+        groupId: message.groupId,
+        text: message.groupId,
+      };
+      logger.debug(`Replying with message: ${JSON.stringify(messageReply)}`);
+      await sendMessageReply(messageReply);
+    }
+    return NextResponse.json({ status: "ok" });
   }
   if (update["chat_join_request"]) {
-    return handleJoinRequest(await parseJoinRequest(update));
-  }
-};
-
-const handleMessageUpdate = async (message: Message): Promise<Response> => {
-  if (message.text.startsWith(groupIdCommand)) {
-    await handleGroupIdCommand(message);
-  }
-  return NextResponse.json({ status: "ok" });
-};
-
-const handleGroupIdCommand = async (message: Message): Promise<void> => {
-  const messageReply = {
-    messageId: message.messageId,
-    groupId: message.groupId,
-    text: message.groupId
-  };
-  if (env.isDev) { console.log(`Replying with message: ${JSON.stringify(messageReply)}`); }
-  await sendMessageReply(messageReply);
-};
-
-const handleJoinRequest = async (request: JoinRequest): Promise<Response> => {
-  if (env.isDev) {
-    console.info(
-      `${request.username} (${request.userId}) requests to join ${request.groupTitle} (${request.groupId})`
+    const joinRequest = await parseJoinRequest(update);
+    logger.debug(
+      `${joinRequest.username} (${joinRequest.userId}) request to join ${joinRequest.groupTitle} (${joinRequest.groupId})`
     );
-  }
 
-  const app = findApp(request.groupId);
-  if (!app) {
-    return errorResponse("Failed to find a matching app for the group");
-  }
+    const app = findApp(joinRequest.groupId);
+    if (!app) {
+      return errorResponse("Failed to find a matching app for the group");
+    }
 
-  const canJoinGroup = await isWhitelistApproved(app, request.userId);
-  try {
-    if (canJoinGroup) {
-      await approve(request);
-    } else {
-      await decline(request);
+    const canJoinGroup = await isWhitelistApproved(app, joinRequest.userId);
+    try {
+      if (canJoinGroup) {
+        await approve(joinRequest);
+      } else {
+        await decline(joinRequest);
+      }
+      return approvedResponse(canJoinGroup);
+    } catch (error) {
+      logger.error(`Failed to approve or decline: ${error.message}`);
+      return errorResponse(`Failed to approve or decline: ${error.message}`);
     }
-    return approvedResponse(canJoinGroup);
-  } catch (error) {
-    if (env.isDev) {
-      console.error(error.message);
-    }
-    return errorResponse(`Failed to approve or decline: ${error.message}`);
   }
 }
 
@@ -97,16 +82,16 @@ const parseMessage = async (update: any): Promise<Message> => {
   return {
     messageId: String(update["message"]["message_id"]),
     groupId: String(update["message"]["chat"]["id"]),
-    text:  update["message"]["text"]
+    text: update["message"]["text"],
   };
-}
+};
 
 const parseJoinRequest = async (update: any): Promise<JoinRequest> => {
   return {
     groupId: String(update["chat_join_request"]["chat"]["id"]),
     groupTitle: String(update["chat_join_request"]["chat"]["title"]),
     userId: String(update["chat_join_request"]["from"]["id"]),
-    username: update["chat_join_request"]["from"]["username"]
+    username: update["chat_join_request"]["from"]["username"],
   };
 };
 
@@ -117,7 +102,7 @@ const isWhitelistApproved = async (
   const store = getUserStore();
   const result = await store.getUsers({
     appSlug: app.slug,
-    userId: telegramId
+    userId: telegramId,
   });
   return result.length > 0;
 };
@@ -127,9 +112,11 @@ const sendMessageReply = async (message: Message): Promise<void> => {
   sendMessageURL.searchParams.append("chat_id", message.groupId);
   sendMessageURL.searchParams.append("reply_to_message_id", message.messageId);
   sendMessageURL.searchParams.append("text", message.text);
-  if (env.isDev) { console.info(sendMessageURL.toString()); }
+  if (env.isDev) {
+    console.info(sendMessageURL.toString());
+  }
   await axios.get(sendMessageURL.toString());
-}
+};
 
 const approve = async (request: JoinRequest): Promise<void> => {
   const approveURL = new URL(
